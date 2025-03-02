@@ -86,12 +86,27 @@ router.post('/webhook', express.raw({ type: 'application/json' }), webhook);
 export default router;
 
 ```
+### /src/utils/FormateDate.js
+```
+export const convertToTimestamptz = (unixTimestamp) => {
+    if (!unixTimestamp || typeof unixTimestamp !== "number") {
+        throw new Error("Invalid timestamp provided");
+    }
+    
+    return new Date(unixTimestamp * 1000).toISOString(); // Converts to UTC ISO format
+}
+
+```
+
 
 ### payment.controller.js
 
 ```
-
+import dotenv from 'dotenv';
+dotenv.config();
 import Stripe from 'stripe';
+import { cancelSubscription, insertSubscription } from '../utils/insert-subscription.utils.js';
+import { convertToTimestamptz } from '../utils/FormateDate.js';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -104,14 +119,14 @@ const priceMap = {
 };
 
 export const subscribe = async (req, res) => {
-    const plan = req.query.plan;
+    const { plan, userId } = req.query;
 
     if (!plan || !priceMap[plan]) {
         return res.status(400).json({ error: 'Invalid subscription plan' });
     }
 
-     // Define plans that should allow coupon codes
-     const plansWithCoupons = ["full-package-3", "full-package-12"]; // Only these will have coupon fields
+    // Define plans that should allow coupon codes
+    const plansWithCoupons = ["full-package-3", "full-package-12"]; // Only these will have coupon fields
 
     try {
         const session = await stripe.checkout.sessions.create({
@@ -120,10 +135,15 @@ export const subscribe = async (req, res) => {
             allow_promotion_codes: plansWithCoupons.includes(plan), // Only enable for selected plans
             success_url: `${req.headers.origin}/checkout-success`,
             cancel_url: `${req.headers.origin}/checkout-cancelled`,
+            metadata: {
+                userId: userId ? userId.toString() : '', // Ensure userId is a string
+                plan : priceMap[plan]
+            },
         });
 
         res.json({ url: session.url });
     } catch (error) {
+        console.error('Stripe error:', error);
         res.status(500).json({ error: error.message });
     }
 };
@@ -149,35 +169,135 @@ export const customerPortal = async (req, res) => {
     }
 };
 
-export const webhook = (req, res) => {
-    const sig = req.headers['stripe-signature'];
+// Store subscriptions in progress with a map using customer ID as the key
+const subscriptionsInProgress = new Map();
 
+export const webhook = async (req, res) => {
+    const sig = req.headers['stripe-signature'];
     let event;
+
     try {
         event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET_KEY);
     } catch (err) {
         return res.status(400).json({ error: `Webhook Error: ${err.message}` });
     }
 
-    switch (event.type) {
-        case 'checkout.session.completed':
-            // console.log('New Subscription started!', event.data);
-            break;
-        case 'invoice.paid':
-            // console.log('Invoice paid', event.data);
-            break;
-        case 'invoice.payment_failed':
-            // console.log('Invoice payment failed!', event.data);
-            break;
-        case 'customer.subscription.updated':
-            // console.log('Subscription updated!', event.data);
-            break;
-        default:
-            console.log(`Unhandled event type ${event.type}`);
-    }
+    try {
+        const eventData = event.data.object;
+        let customerId = null;
 
-    res.send();
+        // Extract the customer ID based on event type
+        if (event.type === 'checkout.session.completed') {
+            customerId = eventData.customer;
+        } else if (['invoice.paid', 'customer.subscription.updated', 'customer.subscription.deleted'].includes(event.type)) {
+            customerId = eventData.customer;
+        }
+
+        if (!customerId) {
+            return res.json({ received: true });
+        }
+
+        // Initialize subscription object if it doesn't exist for this customer
+        if (!subscriptionsInProgress.has(customerId)) {
+            subscriptionsInProgress.set(customerId, {
+                data: {},
+                webhooks: {
+                    checkout_session: false,
+                    invoice_paid: false,
+                    customer_subscription_updated: false,
+                    customer_subscription_deleted: false
+                }
+            });
+        }
+
+        const subscription = subscriptionsInProgress.get(customerId);
+
+        // Process the event based on its type
+        switch (event.type) {
+            case 'checkout.session.completed':
+                const session = eventData;
+                subscription.data = {
+                    userId: session.metadata.userId,
+                    plan : session.metadata.plan,
+                    amount_total: session.amount_total / 100,
+                    customer: session?.customer,
+                    customer_email: session.customer_details?.email,
+                    customer_name: session.customer_details?.name,
+                    customer_phone: session.customer_details?.phone,
+                    tax_exempt: session.customer_details?.tax_exempt,
+                    tax_ids: session.customer_details?.tax_ids,
+                    currency: session.currency,
+                    payment_status: session.payment_status,
+                    expires_at: convertToTimestamptz(session.expires_at),
+                };
+                subscription.webhooks.checkout_session = true;
+                break;
+
+            case 'invoice.paid':
+                const invoice = eventData;
+                subscription.data = {
+                    ...subscription.data,
+                    hosted_invoice_url: invoice.hosted_invoice_url,
+                    invoice_pdf: invoice.invoice_pdf,
+                    invoice_number: invoice.number,
+                };
+                subscription.webhooks.invoice_paid = true;
+                break;
+
+            case 'customer.subscription.updated':
+                const updatedSubscription = eventData;
+                subscription.data = {
+                    ...subscription.data,
+                    status: updatedSubscription.status,
+                    used_tokens: 0,
+                    total_tokens: 15,
+                    current_period_start: convertToTimestamptz(updatedSubscription.current_period_start),
+                    current_period_end: convertToTimestamptz(updatedSubscription.current_period_end),
+                };
+                subscription.webhooks.customer_subscription_updated = true;
+                break;
+
+            case 'customer.subscription.deleted':
+                subscription.data = {
+                    ...subscription.data,
+                    customer : eventData.customer,
+                    status: eventData.status,
+                    current_period_end: convertToTimestamptz(eventData.current_period_end),
+                };
+                subscription.webhooks.customer_subscription_deleted = true;
+                break;
+
+            default:
+                console.log(`Unhandled event type ${event.type}`);
+        }
+
+        // Check conditions before inserting subscription
+if (!subscription.webhooks.customer_subscription_deleted) {
+    const otherWebhooks = Object.entries(subscription.webhooks)
+        .filter(([key]) => key !== "customer_subscription_deleted")
+        .every(([, value]) => value === true);
+
+    if (otherWebhooks) {
+        await insertSubscription(subscription.data);
+        console.log("🚀 ~ webhook ~ subscription.data:", subscription.data)
+        subscriptionsInProgress.delete(customerId);
+    }
+    console.log(`Subscription inserted for customer: ${customerId}`);
+} else {
+    // Subscription was deleted, skip insertion
+    await cancelSubscription(subscription.data);
+    subscriptionsInProgress.delete(customerId);
+    console.log(`Skipping insertion for deleted subscription: ${customerId}`);
+}
+
+
+        return res.json({ received: true });
+    } catch (error) {
+        console.error('Error processing webhook:', error);
+        return res.json({ received: true, error: error.message });
+    }
 };
+
 
 
 ```
